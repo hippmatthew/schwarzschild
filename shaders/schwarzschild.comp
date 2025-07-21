@@ -1,0 +1,127 @@
+#version 460
+
+#define FACE_PX 0
+#define FACE_NX 1
+#define FACE_PY 2
+#define FACE_NY 3
+#define FACE_PZ 4
+#define FACE_NZ 5
+
+// lower value if higher compute space (higher space => higher resolution)
+#define MAX_STEPS 500
+
+// inversely proprtional to MAX_STEPS
+#define BASE_STEP 4.0
+
+// play around with these values
+#define STEP_SCALE 2.0
+#define MIN_STEP 1e-4
+
+// should be fine. ESCAPE_THRESHOLD -> 100.0 possibly
+#define ESCAPE_THRESHOLD 20.0
+#define SINGULARITY_THRESHOLD 1e-2
+
+layout(binding = 1) uniform sampler2D tex_px;
+layout(binding = 2) uniform sampler2D tex_nx;
+layout(binding = 3) uniform sampler2D tex_py;
+layout(binding = 4) uniform sampler2D tex_ny;
+layout(binding = 5) uniform sampler2D tex_pz;
+layout(binding = 6) uniform sampler2D tex_nz;
+
+layout(binding = 7, rgba8) uniform writeonly image2D tex_out;
+
+layout(push_constant) uniform engine_data {
+  layout(row_major) mat4 view_mat;
+  layout(row_major) mat4 proj_mat;
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 sample_background(const vec4 u, const ivec2 index) {
+  const vec3 dir = normalize(u.yzw);
+  const vec3 abs_dir = abs(dir);
+  const float max_component = max(max(abs_dir.x, abs_dir.y), abs_dir.z);
+
+  int face;
+  vec2 uv;
+  if (max_component == abs_dir.x) {
+    if (dir.x > 0.0)  { face = FACE_PX; uv = vec2(-dir.z, -dir.y); }
+    else              { face = FACE_NX; uv = vec2(dir.z, -dir.y); }
+  }
+  else if (max_component == abs_dir.y) {
+    if (dir.y > 0.0)  { face = FACE_PY; uv = vec2(dir.x, dir.z); }
+    else              { face = FACE_NY; uv = vec2(dir.x, -dir.z); }
+  }
+  else {
+    if (dir.z > 0.0)  { face = FACE_PZ; uv = vec2(dir.x, -dir.y); }
+    else              { face = FACE_NZ; uv = vec2(-dir.x, -dir.y); }
+  }
+  uv /= max_component;
+  uv = 0.5 * (uv + 1.0);
+
+  if      (face == FACE_PX) return texture(tex_px, uv).rgb;
+  else if (face == FACE_NX) return texture(tex_nx, uv).rgb;
+  else if (face == FACE_PY) return texture(tex_py, uv).rgb;
+  else if (face == FACE_NY) return texture(tex_ny, uv).rgb;
+  else if (face == FACE_PZ) return texture(tex_pz, uv).rgb;
+  else if (face == FACE_NZ) return texture(tex_nz, uv).rgb;
+
+  return vec3(0.0, 1.0, 1.0);
+}
+
+vec4 init_4vel(const mat4 inv_view, const ivec2 index, const vec4 pos) {
+  const vec2 ndc = 2.0 * vec2(index) / float(imageSize(tex_out)) - 1.0;
+  const vec3 right = inv_view[0].xyz;
+  const vec3 up = inv_view[1].xyz;
+  const vec3 forward = inv_view[2].xyz;
+
+  vec4 view = vec4(ndc, 1.0, 1.0);
+  view = inverse(proj_mat) * view;
+  view /= view.w;
+  const vec3 dir = normalize(view.xyz);
+
+  const vec3 x = pos.yzw;
+  const vec3 s = normalize(dir.x * right + dir.y * up + dir.z * forward);
+
+  float r = length(x);
+
+  // small offset protects from a divide by zero error if r is ever exactly at the event horizon
+  if (r == 2.0) r += 1e-4;
+
+  const float a = sqrt(8.0 / (r * r * r)) * dot(s, x);
+  const float b = 1.0 - 2.0 / r;
+  float c = pow(-1, int(r - 2.0 < 0.0)) * sqrt(a * a + b * dot(s, s)) / b;
+
+  return vec4(a / b + c, s);
+
+  // currently just returning a local 4-velocity. Do the math for the tetrad approach and apply that
+}
+
+void integrate(inout vec4 x, inout vec4 u) {
+  // christoffel approach is to computationally expensive
+  // RK4 is also super expensive
+  // Stick to Euler approach. Solve the geodesic equations with the metric instead to see if its better
+}
+
+void main() {
+  const ivec2 index = ivec2(gl_GlobalInvocationID.xy);
+  const mat4 inv_view = inverse(view_mat);
+
+  vec4 x = vec4(0.0, inv_view[3].xyz);
+  vec4 u = init_4vel(inv_view, index, x);
+
+  vec3 color = vec3(0.0);
+  for (uint i = 0; i < MAX_STEPS; ++i) {
+    integrate(x, u);
+    float r = length(x.yzw);
+
+    if (r < SINGULARITY_THRESHOLD) break;
+
+    if (r > ESCAPE_THRESHOLD || i == MAX_STEPS - 1) {
+      color = sample_background(u, index);
+      break;
+    }
+  }
+
+  imageStore(tex_out, index, vec4(color, 1.0));
+}
