@@ -6,20 +6,14 @@
 #define FACE_NY 3
 #define FACE_PZ 4
 #define FACE_NZ 5
+#define PI 3.14159265
 
-// lower value if higher compute space (higher space => higher resolution)
-#define MAX_STEPS 500
-
-// inversely proprtional to MAX_STEPS
-#define BASE_STEP 4.0
-
-// play around with these values
-#define STEP_SCALE 2.0
-#define MIN_STEP 1e-4
-
-// should be fine. ESCAPE_THRESHOLD -> 100.0 possibly
-#define ESCAPE_THRESHOLD 20.0
+#define Z_OFFSET 48.009
+#define MAX_STEPS 2000
+#define BASE_STEP 1e-2
+#define ESCAPE_THRESHOLD 50.0
 #define SINGULARITY_THRESHOLD 1e-2
+#define SCHWARZSCHILD_RADIUS 2.0
 
 layout(binding = 1) uniform sampler2D tex_px;
 layout(binding = 2) uniform sampler2D tex_nx;
@@ -37,8 +31,23 @@ layout(push_constant) uniform engine_data {
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-vec3 sample_background(const vec4 u, const ivec2 index) {
-  const vec3 dir = normalize(u.yzw);
+vec3 sample_background(const vec4 x, const vec4 u) {
+  const float r = x[1];
+  const float theta = x[2];
+
+  const float r_recip = 1.0 / r;
+  const float a = 2.0 * r_recip;
+  const float b = sqrt(1.0 - a);
+  const mat4 tetrad = mat4(
+    b, 0.0, 0.0, 0.0,
+    sqrt(a) / b, 1.0, 0.0, 0.0,
+    0.0, 0.0, r, 0.0,
+    0.0, 0.0, 0.0, r * sin(theta)
+  );
+
+  const vec4 v = tetrad * u;
+
+  const vec3 dir = normalize(v.wyz);
   const vec3 abs_dir = abs(dir);
   const float max_component = max(max(abs_dir.x, abs_dir.y), abs_dir.z);
 
@@ -69,56 +78,125 @@ vec3 sample_background(const vec4 u, const ivec2 index) {
   return vec3(0.0, 1.0, 1.0);
 }
 
-vec4 init_4vel(const mat4 inv_view, const ivec2 index, const vec4 pos) {
+vec4 init_4pos(const mat4 inv_view) {
+  vec3 pos = inv_view[3].xyz;
+  pos.z -= Z_OFFSET;
+
+  const float r = length(pos);
+  const float theta = acos(-pos.y / r);
+  const float phi = atan(pos.z, pos.x) + PI;
+
+  return vec4(0.0, r, theta, phi);
+}
+
+vec4 init_4vel(const mat4 inv_view, const ivec2 index, const vec4 x) {
   const vec2 ndc = 2.0 * vec2(index) / float(imageSize(tex_out)) - 1.0;
   const vec3 right = inv_view[0].xyz;
   const vec3 up = inv_view[1].xyz;
   const vec3 forward = inv_view[2].xyz;
 
-  vec4 view = vec4(ndc, 1.0, 1.0);
+  vec4 view = vec4(ndc, 0.0, 1.0);
   view = inverse(proj_mat) * view;
   view /= view.w;
   const vec3 dir = normalize(view.xyz);
-
-  const vec3 x = pos.yzw;
   const vec3 s = normalize(dir.x * right + dir.y * up + dir.z * forward);
 
-  float r = length(x);
+  const vec4 v = vec4(1.0, -s.z, -s.y, s.x);
 
-  // small offset protects from a divide by zero error if r is ever exactly at the event horizon
-  if (r == 2.0) r += 1e-4;
+  const float r = x[1];
+  const float theta = x[2];
 
-  const float a = sqrt(8.0 / (r * r * r)) * dot(s, x);
-  const float b = 1.0 - 2.0 / r;
-  float c = pow(-1, int(r - 2.0 < 0.0)) * sqrt(a * a + b * dot(s, s)) / b;
+  const float r_recip = 1.0 / r;
+  const float a = 2.0 * r_recip;
+  const float b = 1.0 - a;
+  const mat4 tetrad_inv = mat4(
+    1.0 / sqrt(b), 0.0, 0.0, 0.0,
+    sqrt(a) / b, 1.0, 0.0, 0.0,
+    0.0, 0.0, r_recip, 0.0,
+    0.0, 0.0, 0.0, r_recip / sin(theta)
+  );
 
-  return vec4(a / b + c, s);
+  return tetrad_inv * v;
+}
 
-  // currently just returning a local 4-velocity. Do the math for the tetrad approach and apply that
+void christoffels(const vec4 x, out float[12] g_out) {
+  float res[12];
+
+  const float r = x[1];
+  const float theta = x[2];
+
+  const float r_recip = 1.0 / r;
+  const float r_recip_2 = r_recip * r_recip;
+  const float a = 2.0 * r_recip;
+  const float b = 1.0 - a;
+  const float sint = sin(theta);
+  const float cost = cos(theta);
+
+  res[0] = r_recip_2 / b;           // Gamma_000
+  res[1] = r_recip_2 / sqrt(b);     // Gamma_001
+  res[2] = r_recip_2 * (1 + a) / b; // Gamma_011
+
+  res[3] = r_recip_2 * b;           // Gamma_100
+  res[4] = r_recip_2 * sqrt(a);     // Gamma_101
+  res[5] = -r_recip_2;              // Gamma_111
+  res[6] = -r;                      // Gamma_122
+  res[7] = -r * sint * sint;        // Gamma_133
+
+  res[8] = r_recip;                 // Gamma_212
+  res[9] = -sint * cost;            // Gamma_233
+
+  res[10] = r_recip;                // Gamma_313
+  res[11] = cost / sint;            // Gamma_323
+
+  g_out = res;
 }
 
 void integrate(inout vec4 x, inout vec4 u) {
-  // christoffel approach is to computationally expensive
-  // RK4 is also super expensive
-  // Stick to Euler approach. Solve the geodesic equations with the metric instead to see if its better
+  // Stick to Euler method until simulation is done. Then try top optimize and fit in RK4 or RK2
+
+  float g[12];
+  christoffels(x, g);
+
+  const float uT = u[0];
+  const float ur = u[1];
+  const float ut = u[2];
+  const float up = u[3];
+
+  const float uT_uT = uT * uT;
+  const float uT_ur = uT * ur;
+  const float ur_ur = ur * ur;
+  const float up_up = up * up;
+
+  const float dl = BASE_STEP;
+  vec4 du = vec4(
+    -(g[0] * uT_uT + 2 * g[1] * uT_ur + g[2] * ur_ur),
+    -(g[3] * uT_uT + 2 * g[4] * uT_ur + g[5] * ur_ur + g[6] * ut * ut + g[7] * up_up),
+    -(2 * g[8] * ur * ut + g[9] * up_up),
+    -2 * (g[10] * ur * up + g[11] * ut * up)
+  );
+  du *= dl;
+
+  u += du;
+  x += u * dl;
 }
 
 void main() {
   const ivec2 index = ivec2(gl_GlobalInvocationID.xy);
   const mat4 inv_view = inverse(view_mat);
 
-  vec4 x = vec4(0.0, inv_view[3].xyz);
+  vec4 x = init_4pos(inv_view);
   vec4 u = init_4vel(inv_view, index, x);
+  const float init_r = x[1];
 
   vec3 color = vec3(0.0);
   for (uint i = 0; i < MAX_STEPS; ++i) {
     integrate(x, u);
-    float r = length(x.yzw);
+    float r = x[1];
 
+    if (init_r > SCHWARZSCHILD_RADIUS && r < SCHWARZSCHILD_RADIUS) break;
     if (r < SINGULARITY_THRESHOLD) break;
-
-    if (r > ESCAPE_THRESHOLD || i == MAX_STEPS - 1) {
-      color = sample_background(u, index);
+    if (r > ESCAPE_THRESHOLD) {
+      color = sample_background(x, u);
       break;
     }
   }
